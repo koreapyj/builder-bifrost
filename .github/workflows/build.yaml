@@ -1,0 +1,230 @@
+name: Build patched Bifrost image
+
+# Tracks the newest stable Bifrost gateway release (tag transports/vX.Y.Z)
+# daily. A build runs only when the (upstream version, patch set) pair has no
+# published image yet, so most scheduled runs are no-ops. The patch set
+# includes the resolved commit of every plugin, so a new commit on a plugin's
+# tracked branch also triggers a build. Any failure -- a patch that no longer
+# applies with fuzz=0, a build error, or a plugin that does not load in the
+# smoke test -- fails the run: that is the signal that work is needed.
+
+on:
+  push:
+    branches:
+      - '**'
+    paths-ignore:
+      - '**/*.md'
+      - 'LICENSE'
+  pull_request:
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+    inputs:
+      bifrost_version:
+        description: 'Bifrost version vX.Y.Z to build (tag transports/vX.Y.Z; default: newest stable). Not tagged latest.'
+        required: false
+        default: ''
+      force:
+        description: 'Rebuild and re-push even if the image already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != format('refs/heads/{0}', github.event.repository.default_branch)) }}
+
+env:
+  BIFROST_GH_REPO: maximhq/bifrost
+  IMAGE: ghcr.io/koreapyj/bifrost
+
+jobs:
+  resolve:
+    name: Resolve upstream version, plugins and patch revision
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      rev: ${{ steps.resolve.outputs.rev }}
+      plugins_lock: ${{ steps.resolve.outputs.plugins_lock }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      latest: ${{ steps.resolve.outputs.latest }}
+      has_work: ${{ steps.resolve.outputs.has_work }}
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLUGINS_GH_TOKEN: ${{ secrets.PLUGINS_GH_TOKEN }}
+          INPUT_VERSION: ${{ inputs.bifrost_version }}
+          INPUT_FORCE: ${{ inputs.force }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "${INPUT_VERSION:-}" ]; then
+            version="${INPUT_VERSION}"
+            latest=false
+          else
+            version="$(bash support/latest-tag.sh)"
+            latest=true
+          fi
+
+          mkdir -p .work
+          bash support/plugins.sh resolve .work/plugins.lock
+          rev="$(bash support/rev.sh .work/plugins.lock)"
+
+          publish=false
+          if [ "${GITHUB_EVENT_NAME}" != pull_request ] && [ "${GITHUB_REF}" = "refs/heads/${DEFAULT_BRANCH}" ]; then
+            publish=true
+          fi
+
+          has_work=true
+          if [ "${publish}" = true ] && [ "${INPUT_FORCE:-false}" != true ]; then
+            echo "${GH_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin >/dev/null
+            if docker manifest inspect "${IMAGE}:${version}-${rev}" >/dev/null 2>&1; then
+              echo "::notice::${IMAGE}:${version}-${rev} already published -- nothing to do."
+              has_work=false
+            fi
+          fi
+
+          amd64='{"arch":"amd64","runner":"ubuntu-26.04"}'
+          arm64='{"arch":"arm64","runner":"ubuntu-26.04-arm"}'
+          if [ "${publish}" = true ]; then
+            matrix="{\"include\":[${amd64},${arm64}]}"
+          else
+            matrix="{\"include\":[${amd64}]}"
+          fi
+
+          {
+            echo "version=${version}"
+            echo "rev=${rev}"
+            echo "publish=${publish}"
+            echo "latest=${latest}"
+            echo "has_work=${has_work}"
+            echo "matrix=${matrix}"
+            echo 'plugins_lock<<EOF_PLUGINS_LOCK'
+            cat .work/plugins.lock
+            echo 'EOF_PLUGINS_LOCK'
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Bifrost \`${version}\` + patches \`${rev}\`"
+            echo "- publish: ${publish}"
+            echo "- has_work: ${has_work}"
+            echo "- plugins:"
+            sed 's/^/  - /' .work/plugins.lock
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  build:
+    name: Build (${{ matrix.arch }})
+    needs: resolve
+    if: needs.resolve.outputs.has_work == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      REV: ${{ needs.resolve.outputs.rev }}
+      PLUGINS_LOCK: ${{ needs.resolve.outputs.plugins_lock }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install quilt
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends quilt
+
+      - name: Download Bifrost
+        run: bash support/fetch-bifrost.sh "${VERSION}" src
+
+      - name: Apply patches (fuzz=0)
+        run: bash support/apply-patches.sh src patches
+
+      # Uses the commits resolved once in the resolve job, so every architecture
+      # builds the same plugin sources.
+      - name: Stage plugins
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLUGINS_GH_TOKEN: ${{ secrets.PLUGINS_GH_TOKEN }}
+        run: |
+          mkdir -p .work
+          printf '%s\n' "${PLUGINS_LOCK}" > .work/plugins.lock
+          bash support/plugins.sh stage src .work/plugins.lock
+
+      - name: Build image
+        run: |
+          bash support/build-image.sh src bifrost-patched:ci \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.version=${VERSION}-${REV}" \
+            --label "org.opencontainers.image.base.name=${GITHUB_SERVER_URL}/${BIFROST_GH_REPO}@transports/${VERSION}" \
+            --label "org.opencontainers.image.description=Bifrost ${VERSION} + patch set ${REV}; plugins: $(awk 'NF{printf "%s%s@%s", s, $1, substr($2,1,12); s=", "}' .work/plugins.lock)"
+
+      - name: Smoke test
+        run: bash support/smoke.sh bifrost-patched:ci
+
+      - name: Log in to GHCR
+        if: needs.resolve.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push per-arch image
+        if: needs.resolve.outputs.publish == 'true'
+        run: |
+          tag="${IMAGE}:${VERSION}-${REV}-${ARCH}"
+          docker tag bifrost-patched:ci "${tag}"
+          docker push "${tag}"
+
+  manifest:
+    name: Publish multi-arch manifest
+    needs: [resolve, build]
+    if: needs.resolve.outputs.publish == 'true' && needs.resolve.outputs.has_work == 'true'
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      REV: ${{ needs.resolve.outputs.rev }}
+      LATEST: ${{ needs.resolve.outputs.latest }}
+    steps:
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create manifest
+        run: |
+          set -euo pipefail
+          tags=(--tag "${IMAGE}:${VERSION}-${REV}" --tag "${IMAGE}:${VERSION}")
+          if [ "${LATEST}" = true ]; then
+            tags+=(--tag "${IMAGE}:latest")
+          fi
+          docker buildx imagetools create "${tags[@]}" \
+            "${IMAGE}:${VERSION}-${REV}-amd64" \
+            "${IMAGE}:${VERSION}-${REV}-arm64"
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}-${REV}"

@@ -1,0 +1,18 @@
+# Used by BuildKit for support/Dockerfile (takes precedence over any
+# .dockerignore in the Bifrost tree). Keep what the workspace build needs:
+# core/, framework/, transports/, plugins/, ui/ and .builder/.
+**/.git
+**/.pc
+**/node_modules
+ui/out
+ui/.next
+docs
+examples
+tests
+helm-charts
+terraform
+recipes
+npx
+cli
+go.work
+go.work.sum
