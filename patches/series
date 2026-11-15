@@ -1,1 +1,3 @@
 0001-anthropic-parallel-server-tool-stream.patch
+0002-anthropic-citation-nullable-fields.patch
+0003-anthropic-search-result-citation-index.patch

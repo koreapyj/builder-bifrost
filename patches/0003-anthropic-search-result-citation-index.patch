@@ -1,0 +1,57 @@
+anthropic: keep search_result_index on search_result_location citations
+
+search_result_index is a required field of Anthropic's search_result_location
+citation. The Responses annotation had no field for it, so the Anthropic ->
+Responses conversion dropped it and the Responses -> Anthropic conversion
+could not restore it. Every route that passes citations through Responses
+annotations lost it: the stream and non-stream responses sent to Anthropic
+clients, and assistant-message citations sent upstream, where Anthropic
+answers with a 400 because the field is missing.
+
+Add SearchResultIndex to ResponsesOutputMessageContentTextAnnotation next to
+the other Anthropic-specific fields, deep-copy it, and map it in both
+directions for search_result_location. On /v1/responses, a
+search_result_location annotation now also carries search_result_index.
+
+--- a/core/schemas/responses.go
++++ b/core/schemas/responses.go
+@@ -2188,6 +2188,8 @@ type ResponsesOutputMessageContentTextAn
+ 	EndBlockIndex   *int    `json:"end_block_index,omitempty"`
+ 	Source          *string `json:"source,omitempty"`
+ 	EncryptedIndex  *string `json:"encrypted_index,omitempty"`
++
++	SearchResultIndex *int `json:"search_result_index,omitempty"` // search_result_location
+ }
+ 
+ // ResponsesOutputMessageContentTextLogProb represents log probability information for content.
+--- a/core/schemas/utils.go
++++ b/core/schemas/utils.go
+@@ -2194,6 +2194,10 @@ func deepCopyResponsesMessageContentBloc
+ 					copyEndBlockIndex := *annotation.EndBlockIndex
+ 					copyAnnotation.EndBlockIndex = &copyEndBlockIndex
+ 				}
++				if annotation.SearchResultIndex != nil {
++					copySearchResultIndex := *annotation.SearchResultIndex
++					copyAnnotation.SearchResultIndex = &copySearchResultIndex
++				}
+ 				if annotation.Source != nil {
+ 					copySource := *annotation.Source
+ 					copyAnnotation.Source = &copySource
+--- a/core/providers/anthropic/responses.go
++++ b/core/providers/anthropic/responses.go
+@@ -11208,6 +11208,7 @@ func convertAnthropicCitationToAnnotatio
+ 		// Search result location fields
+ 		annotation.StartBlockIndex = citation.StartBlockIndex
+ 		annotation.EndBlockIndex = citation.EndBlockIndex
++		annotation.SearchResultIndex = citation.SearchResultIndex
+ 		annotation.Title = citation.Title
+ 		annotation.Source = citation.Source
+ 	}
+@@ -11263,6 +11264,7 @@ func convertAnnotationToAnthropicCitatio
+ 		// Search result location
+ 		citation.StartBlockIndex = annotation.StartBlockIndex
+ 		citation.EndBlockIndex = annotation.EndBlockIndex
++		citation.SearchResultIndex = annotation.SearchResultIndex
+ 		citation.Title = annotation.Title
+ 		citation.Source = annotation.Source
+ 

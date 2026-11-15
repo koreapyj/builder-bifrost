@@ -1,0 +1,72 @@
+anthropic: keep required-but-nullable citation fields as explicit nulls
+
+Anthropic defines some citation fields as required but nullable:
+document_title for char_location, page_location and content_block_location,
+and title for web_search_result_location and search_result_location. A
+citation for an untitled document arrives with "document_title": null.
+
+Every optional AnthropicTextCitation field is a pointer with omitempty, so
+the null decoded to nil and the key was dropped whenever Bifrost wrote the
+citation again: in citations_delta stream events and content[].citations
+sent to clients, in assistant-message citations sent upstream (even when the
+client sent the null explicitly), and on the round trip through Responses
+annotations. A client that replayed such a citation got
+  400 ... citations.0.page_location.document_title: Field required
+
+AnthropicTextCitation.MarshalJSON now writes the citation as before and, for
+the citation's type, appends the required-but-nullable key as null when it is
+unset. Set fields, other unset fields, and citations of other types serialize
+exactly as before.
+
+--- a/core/providers/anthropic/types.go
++++ b/core/providers/anthropic/types.go
+@@ -1646,6 +1646,49 @@ type AnthropicTextCitation struct {
+ 	Source            *string `json:"source,omitempty"`
+ }
+ 
++// MarshalJSON writes the citation with its omitempty tags, then adds the field
++// Anthropic defines as required but nullable for the citation's type as an
++// explicit null when it is unset: document_title for char_location,
++// page_location and content_block_location; title for
++// web_search_result_location and search_result_location. Anthropic rejects a
++// citation sent back in an assistant message without that key ("Field
++// required"). Every other unset field is still omitted, so set fields and
++// other types serialize exactly as before.
++func (c AnthropicTextCitation) MarshalJSON() ([]byte, error) {
++	type alias AnthropicTextCitation
++	data, err := providerUtils.MarshalSorted(alias(c))
++	if err != nil {
++		return nil, err
++	}
++
++	var nullKey string
++	switch c.Type {
++	case AnthropicCitationTypeCharLocation, AnthropicCitationTypePageLocation, AnthropicCitationTypeContentBlockLocation:
++		if c.DocumentTitle == nil {
++			nullKey = "document_title"
++		}
++	case AnthropicCitationTypeWebSearchResultLocation, AnthropicCitationTypeSearchResultLocation:
++		if c.Title == nil {
++			nullKey = "title"
++		}
++	}
++	if nullKey == "" {
++		return data, nil
++	}
++
++	// data is a non-empty object: type and cited_text are always written.
++	data = bytes.TrimRight(data, " \t\r\n")
++	if len(data) < 2 || data[len(data)-1] != '}' {
++		return nil, fmt.Errorf("unexpected citation encoding: %s", data)
++	}
++	out := make([]byte, 0, len(data)+len(nullKey)+9)
++	out = append(out, data[:len(data)-1]...)
++	out = append(out, `,"`...)
++	out = append(out, nullKey...)
++	out = append(out, `":null}`...)
++	return out, nil
++}
++
+ // AnthropicCitations can represent either:
+ // - Request: {enabled: true}
+ // - Response: [{type: "...", cited_text: "...", ...}]
